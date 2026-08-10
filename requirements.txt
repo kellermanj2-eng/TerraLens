@@ -1,0 +1,6 @@
+opencv-python
+numpy
+rasterio
+streamlit
+ibm-watsonx-ai
+python-dotenv
