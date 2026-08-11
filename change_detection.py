@@ -89,26 +89,46 @@ def load_image(path: str) -> np.ndarray:
 # Alignment  (ORB feature matching + RANSAC homography)
 # ---------------------------------------------------------------------------
 
-# Minimum number of good feature matches required to attempt homography.
-# Falls back to simple resize-only alignment if fewer matches are found.
-_MIN_MATCH_COUNT = 10
+# Minimum good matches required before attempting a homography.
+# Raised to 12 so that marginal match sets (which produce garbage H matrices)
+# are rejected early and fall back to the unwarped image.
+_MIN_MATCH_COUNT = 12
+
+# Determinant bounds for homography validation.
+# det(H[:2,:2]) ≈ 1.0 for a pure translation/rotation.
+# Values outside [0.5, 2.0] indicate extreme scale, shear, or a reflected warp
+# — all signs of a degenerate RANSAC solution on low-texture imagery.
+_H_DET_MIN = 0.5
+_H_DET_MAX = 2.0
+
+# Cloud-cover guard: fraction of pixels brighter than this grayscale threshold
+# that triggers a warning.  Does NOT block processing.
+_CLOUD_BRIGHT_THRESH   = 200   # grayscale value (0-255)
+_CLOUD_FRACTION_WARN   = 0.60  # warn if > 60 % of pixels exceed threshold
 
 
-def load_and_align(before_path: str, after_path: str) -> tuple[np.ndarray, np.ndarray]:
+def load_and_align(
+    before_path: str,
+    after_path: str,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """
-    Load both images and align the "after" image to the "before" image.
+    Load both images, optionally warp "after" onto "before", and return a
+    list of any advisory warnings produced during alignment.
 
     Alignment strategy
     ------------------
-    1. Resize "after" to the spatial dimensions of "before" so the two arrays
-       are always the same shape, regardless of the input resolution.
-    2. Detect ORB keypoints + descriptors in both grayscale images.
-    3. Match descriptors with a brute-force Hamming matcher and apply Lowe's
-       ratio test (0.75) to keep only reliable matches.
-    4. If ≥ _MIN_MATCH_COUNT good matches exist, compute a perspective
-       homography with RANSAC and warp "after" onto "before".
-    5. If too few matches are found (low-texture or near-identical images),
-       return the resized "after" unchanged — the caller can still diff it.
+    1. Resize "after" to the spatial dimensions of "before".
+    2. Cloud-cover guard: if either grayscale image has > 60 % very-bright
+       pixels (> 200), record a warning but continue.
+    3. Detect ORB keypoints + descriptors in both grayscale images.
+    4. Match with knnMatch (k=2) + Lowe ratio test (0.75) to discard
+       ambiguous matches that cause false homographies on low-texture scenes.
+    5. Require ≥ 12 good matches before attempting homography; otherwise skip
+       warping entirely and return the resized-but-unwarped "after".
+    6. Compute RANSAC homography H and validate its determinant:
+       only warp if 0.5 < det(H[:2,:2]) < 2.0.  Values outside that range
+       indicate extreme scale/shear/flip — a degenerate solution that would
+       smear the image into streaks.  Fall back to unwarped on failure.
 
     Parameters
     ----------
@@ -117,8 +137,13 @@ def load_and_align(before_path: str, after_path: str) -> tuple[np.ndarray, np.nd
 
     Returns
     -------
-    (before, after_aligned) — both as uint8 BGR arrays of identical shape.
+    (before, after_aligned, warnings)
+        before        – uint8 BGR reference array.
+        after_aligned – uint8 BGR array, same shape as before.
+        warnings      – list of human-readable advisory strings (may be empty).
     """
+    warnings: list[str] = []
+
     before = load_image(before_path)
     after  = load_image(after_path)
 
@@ -128,19 +153,35 @@ def load_and_align(before_path: str, after_path: str) -> tuple[np.ndarray, np.nd
     if after.shape[:2] != (h, w):
         after = cv2.resize(after, (w, h), interpolation=cv2.INTER_AREA)
 
-    # Step 2 — ORB keypoints & descriptors
-    orb = cv2.ORB_create(nfeatures=5000)
+    # Step 2 — cloud-cover guard (advisory only, does not block)
     ref_gray = cv2.cvtColor(before, cv2.COLOR_BGR2GRAY)
     tgt_gray = cv2.cvtColor(after,  cv2.COLOR_BGR2GRAY)
+    total_px = ref_gray.size
+    before_bright = np.count_nonzero(ref_gray > _CLOUD_BRIGHT_THRESH) / total_px
+    after_bright  = np.count_nonzero(tgt_gray > _CLOUD_BRIGHT_THRESH) / total_px
+    if before_bright > _CLOUD_FRACTION_WARN:
+        msg = (f"Before image appears heavily cloud-covered "
+               f"({before_bright:.0%} bright pixels). "
+               "Change detection results may be unreliable.")
+        print(f"[TerraLens WARNING] {msg}")
+        warnings.append(msg)
+    if after_bright > _CLOUD_FRACTION_WARN:
+        msg = (f"After image appears heavily cloud-covered "
+               f"({after_bright:.0%} bright pixels). "
+               "Change detection results may be unreliable.")
+        print(f"[TerraLens WARNING] {msg}")
+        warnings.append(msg)
 
+    # Step 3 — ORB keypoints & descriptors
+    orb = cv2.ORB_create(nfeatures=5000)
     kp_ref, des_ref = orb.detectAndCompute(ref_gray, None)
     kp_tgt, des_tgt = orb.detectAndCompute(tgt_gray, None)
 
     # Guard: nothing to match if either image has no descriptors
     if des_ref is None or des_tgt is None or len(kp_ref) < 2 or len(kp_tgt) < 2:
-        return before, after
+        return before, after, warnings
 
-    # Step 3 — brute-force Hamming matching + ratio test
+    # Step 4 — knnMatch (k=2) + Lowe ratio test
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
     raw_matches = bf.knnMatch(des_ref, des_tgt, k=2)
 
@@ -152,21 +193,35 @@ def load_and_align(before_path: str, after_path: str) -> tuple[np.ndarray, np.nd
             if m.distance < 0.75 * n.distance:
                 good.append(m)
 
-    # Step 4 — homography (needs ≥ 4 points; we require more for robustness)
-    if len(good) >= _MIN_MATCH_COUNT:
-        src_pts = np.float32([kp_ref[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-        dst_pts = np.float32([kp_tgt[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    # Step 5 — require ≥ 12 good matches before attempting homography
+    if len(good) < _MIN_MATCH_COUNT:
+        return before, after, warnings
 
-        H, inlier_mask = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
+    src_pts = np.float32([kp_ref[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp_tgt[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
-        if H is not None:
-            after_aligned = cv2.warpPerspective(after, H, (w, h),
-                                                flags=cv2.INTER_LINEAR,
-                                                borderMode=cv2.BORDER_REPLICATE)
-            return before, after_aligned
+    H, _ = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
 
-    # Step 5 — fallback: return resized but unwarped "after"
-    return before, after
+    # Step 6 — validate H before warping
+    if H is None:
+        return before, after, warnings
+
+    det = float(np.linalg.det(H[:2, :2]))
+    if not (_H_DET_MIN < det < _H_DET_MAX):
+        print(f"[TerraLens WARNING] Homography rejected (det={det:.4f}); "
+              "using unwarped image to avoid warp artefacts.")
+        warnings.append(
+            f"Alignment skipped: homography determinant ({det:.3f}) is outside "
+            f"the valid range [{_H_DET_MIN}, {_H_DET_MAX}]. "
+            "The images are compared without warping — ensure they cover the "
+            "same geographic area."
+        )
+        return before, after, warnings
+
+    after_aligned = cv2.warpPerspective(after, H, (w, h),
+                                        flags=cv2.INTER_LINEAR,
+                                        borderMode=cv2.BORDER_REPLICATE)
+    return before, after_aligned, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -268,9 +323,75 @@ def detect_change(
         "total_pixels":    total_px,
         "changed_pixels":  changed_px,
         "change_percent":  round(changed_px / total_px * 100, 2) if total_px else 0.0,
+        # real-world area — filled in by the caller if GSD is known, else None
+        "changed_km2":     None,
     }
 
     return mask, stats
+
+
+# ---------------------------------------------------------------------------
+# GeoJSON export
+# ---------------------------------------------------------------------------
+
+def regions_to_geojson(
+    regions: list[dict],
+    bbox: tuple[float, float, float, float],
+    image_shape: tuple[int, int],
+) -> dict:
+    """
+    Convert pixel-space region bounding boxes to a GeoJSON FeatureCollection.
+
+    Each region becomes a GeoJSON Polygon feature whose coordinates are the
+    WGS-84 lon/lat corners derived by interpolating the pixel position within
+    the image's geographic bounding box.
+
+    Parameters
+    ----------
+    regions     : list of region dicts from detect_change() stats["regions"].
+                  Each must have keys x, y, w, h (pixel bounding box).
+    bbox        : (min_lon, min_lat, max_lon, max_lat) geographic extent of
+                  the image in WGS-84 degrees.
+    image_shape : (height, width) in pixels — before.shape[:2].
+
+    Returns
+    -------
+    GeoJSON FeatureCollection dict (JSON-serialisable).
+    """
+    min_lon, min_lat, max_lon, max_lat = bbox
+    img_h, img_w = image_shape
+
+    def px_to_lonlat(px_x: float, px_y: float) -> list[float]:
+        lon = min_lon + (px_x / img_w) * (max_lon - min_lon)
+        # pixel row 0 = top = max_lat; row img_h = bottom = min_lat
+        lat = max_lat - (px_y / img_h) * (max_lat - min_lat)
+        return [round(lon, 6), round(lat, 6)]
+
+    features = []
+    for i, r in enumerate(regions):
+        x, y, w, h = r["x"], r["y"], r["w"], r["h"]
+        # Clockwise ring: top-left → top-right → bottom-right → bottom-left → close
+        ring = [
+            px_to_lonlat(x,     y),
+            px_to_lonlat(x + w, y),
+            px_to_lonlat(x + w, y + h),
+            px_to_lonlat(x,     y + h),
+            px_to_lonlat(x,     y),      # closed
+        ]
+        features.append({
+            "type": "Feature",
+            "id": i,
+            "properties": {
+                "rank":    i + 1,
+                "area_px": r["area_px"],
+            },
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [ring],
+            },
+        })
+
+    return {"type": "FeatureCollection", "features": features}
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +489,7 @@ def run_pipeline(
       overlay_path  – saved overlay file path
       stats         – change statistics dict
     """
-    before, after_aligned = load_and_align(before_path, after_path)
+    before, after_aligned, warnings = load_and_align(before_path, after_path)
     mask, stats = detect_change(before, after_aligned, threshold, min_area)
 
     overlay_path = os.path.join(output_dir, "change_overlay.png")
@@ -383,6 +504,7 @@ def run_pipeline(
         "mask_path":    mask_path,
         "overlay_path": overlay_path,
         "stats":        stats,
+        "warnings":     warnings,
     }
 
 
@@ -411,7 +533,9 @@ if __name__ == "__main__":
     args = _build_parser().parse_args()
 
     print(f"[TerraLens] Loading and aligning images…")
-    before, after_aligned = load_and_align(args.before, args.after)
+    before, after_aligned, warnings = load_and_align(args.before, args.after)
+    for w in warnings:
+        print(f"[TerraLens WARNING] {w}")
 
     print(f"[TerraLens] Detecting changes (threshold={args.threshold}, "
           f"min_area={args.min_area})…")

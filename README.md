@@ -166,7 +166,7 @@ bounding box.
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-username/terralens.git
+git clone https://github.com/kellermanj2-eng/TerraLens.git
 cd terralens
 
 # 2. Create and activate a virtual environment
@@ -233,14 +233,53 @@ Stats are printed to stdout as formatted JSON:
 
 ## Roadmap
 
-| Priority | Feature |
-|---|---|
-| 🔜 Near-term | Multi-temporal analysis (3+ images → change trend chart) |
+### Phase 1 — Foundation ✅ Complete
+
+| Status | Feature |
+|--------|---------|
+| ✅ Done | Streamlit dashboard — upload, align, detect, overlay, narrate, download |
+| ✅ Done | ORB + RANSAC alignment pipeline (`change_detection.py`) |
+| ✅ Done | IBM Granite narration with template fallback (`narrate.py`) |
+| ✅ Done | No-credentials offline mode (template narrative fallback) |
+| ✅ Done | CLI interface (`python change_detection.py --before … --after …`) |
+
+---
+
+### Phase 2 — Live Satellite Image Acquisition 🔜 Next
+
+The goal of this phase is to eliminate the manual upload step entirely.
+Users will enter a location and date range; TerraLens fetches the imagery automatically.
+
+| Status | Feature | Notes |
+|--------|---------|-------|
+| ✅ Done | **NASA Worldview / GIBS auto-fetch** — `satellite_fetch.py` queries NASA CMR + stitches GIBS WMTS tiles; **no account required** | MODIS Terra (daily) and Landsat annual composites via [NASA GIBS](https://worldview.earthdata.nasa.gov/) |
+| ✅ Done | **Map-based AOI picker** — Leaflet.js draw widget in Fetch mode; coordinate bbox fallback; session-state persisted across reruns | Powered by `streamlit-folium` + `folium.plugins.Draw` |
+| ✅ Done | **MCP satellite tool server** — `mcp_server.py` exposes `search_satellite_scenes`, `fetch_scene_pair`, `run_change_detection`, `narrate_change` as MCP tools | Register with: `bob mcp add --name terralens --command "python mcp_server.py"` |
+| 🔜 Near-term | **Copernicus / Sentinel-2 integration** — optionally add CDSE OData search for higher-resolution (10 m) Sentinel-2 L2A scenes | Free registration at [dataspace.copernicus.eu](https://dataspace.copernicus.eu/) required |
+| 🔮 Future | **Automated scene scheduling** — cron-style job that polls for new acquisitions over saved AOIs and triggers change detection + narration automatically | Sentinel-2 5-day revisit cadence |
+| 🔮 Future | **Cloud-mask filtering** — use Sentinel-2 SCL band or NASA Fmask to reject cloudy scenes before comparison | Reduces false-positive change detections |
+
+---
+
+### Phase 3 — Analysis Depth
+
+| Status | Feature |
+|--------|---------|
+| ✅ Done | Multi-temporal analysis — date-series input → consecutive-pair change % → `st.line_chart` trend |
+| ✅ Done | GeoJSON export of changed-region bounding boxes (`regions_to_geojson()` in `change_detection.py`) |
+| ✅ Done | Change area in real-world km² — computed from bbox lon/lat span, shown in metrics row |
 | 🔜 Near-term | NDVI differencing for vegetation health using Sentinel-2 NIR bands |
-| 🔜 Near-term | GeoJSON export of changed-region bounding boxes |
-| 🔮 Future | Watsonx.data integration for automated image retrieval by coordinates + date |
+
+---
+
+### Phase 4 — AI & Visualisation 🔮 Future
+
+| Status | Feature |
+|--------|---------|
 | 🔮 Future | Fine-tuned Granite classifier trained on labelled satellite change events |
 | 🔮 Future | Side-by-side swipe viewer with Leaflet.js map overlay |
+| 🔮 Future | Watsonx.data integration for image catalogue management and retrieval |
+| 🔮 Future | Multi-spectral false-colour composites (NIR / SWIR band combinations) |
 
 ---
 

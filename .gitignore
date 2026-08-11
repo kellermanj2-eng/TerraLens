@@ -29,3 +29,9 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Downloaded satellite tiles (fetched at runtime, not source)
+data/*.png
+data/*.jpg
+data/*.tif
+data/*.tiff

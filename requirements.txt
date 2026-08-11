@@ -4,3 +4,8 @@ rasterio
 streamlit
 ibm-watsonx-ai
 python-dotenv
+requests
+Pillow
+folium
+streamlit-folium
+mcp
