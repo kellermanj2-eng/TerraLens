@@ -1,0 +1,18 @@
+services:
+  terralens:
+    build: .
+    image: terralens:latest
+    container_name: terralens
+    ports:
+      - "8501:8501"
+    volumes:
+      # Persist the scene catalogue and downloaded data outside the container
+      - ./data:/app/data
+      - ./results:/app/results
+    env_file:
+      # Copy .env.example → .env and fill in credentials (all optional)
+      - path: .env
+        required: false
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+    restart: unless-stopped

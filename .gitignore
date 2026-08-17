@@ -35,3 +35,8 @@ data/*.png
 data/*.jpg
 data/*.tif
 data/*.tiff
+
+# Track the bundled sample images (synthetic, no credentials needed)
+!data/sample_before.png
+!data/sample_after.png
+

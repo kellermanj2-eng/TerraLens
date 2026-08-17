@@ -6,6 +6,49 @@ Detect meaningful change between two satellite images of the same location
 taken at different dates, then use **IBM Granite** to narrate what happened on
 the ground — in plain language any non-specialist can act on.
 
+[![Tests](https://img.shields.io/badge/tests-66%20passed-brightgreen)](#test-suite)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)]()
+[![Docker](https://img.shields.io/badge/docker-one--command-blue)](#docker-one-command)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+---
+
+## Quick Start
+
+### Option A — Docker (one command, no Python required)
+
+```bash
+git clone https://github.com/kellermanj2-eng/TerraLens.git
+cd TerraLens/terralens
+docker compose up
+```
+
+Open **http://localhost:8501** — the app runs fully offline with template
+narration. Add watsonx.ai / Copernicus credentials to a `.env` file to unlock
+live Granite narration and Sentinel-2 downloads (see [`.env.example`](.env.example)).
+
+### Option B — Python
+
+```bash
+git clone https://github.com/kellermanj2-eng/TerraLens.git
+cd TerraLens/terralens
+python -m venv .venv && .venv\Scripts\activate   # Windows
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+### Try it instantly — bundled sample images
+
+The repo includes a synthetic before/after pair in `data/` that works
+out-of-the-box without any credentials or downloads:
+
+1. In the app, select **📂 Upload images**
+2. Upload `data/sample_before.png` as **Before**
+3. Upload `data/sample_after.png` as **After**
+4. Click **✨ Generate AI Narration**
+
+Expected result: ~14 % scene change with a large burn-scar region detected.
+
 ---
 
 ## Problem Statement
@@ -33,11 +76,12 @@ Given a **before** image and an **after** image of the same geographic area:
    binary thresholding, morphological opening, and contour extraction isolate
    meaningful changed regions and filter sensor noise.
 3. **Narration** — quantitative stats (fraction changed, region count, largest
-   region area) are passed as a structured prompt to IBM Granite, which
+   region area) are passed as a few-shot prompt to IBM Granite, which
    classifies the probable change type and produces a confidence-annotated
    plain-language summary.
-4. **Dashboard** — a Streamlit app ties everything together: upload, analyse,
-   compare, and download results in a single browser session.
+4. **Dashboard** — a Streamlit app ties everything together: upload or
+   auto-fetch, analyse, swipe-compare, NDVI, false-colour, catalogue,
+   and download results in a single browser session.
 
 ---
 
@@ -63,6 +107,7 @@ Given a **before** image and an **after** image of the same geographic area:
                      ▼
   ┌──────────────────────────────────────┐
   │   detect_change()                    │
+  │   • SCL cloud-mask suppression       │
   │   • grayscale absdiff                │
   │   • Gaussian blur (5×5)              │
   │   • binary threshold                 │
@@ -76,16 +121,17 @@ Given a **before** image and an **after** image of the same geographic area:
                       num_regions
                       top-10 regions
                       largest area px²
+                      cloud_masked_pct
              │              │
              ▼              ▼
   ┌──────────────┐   ┌──────────────────────────────────┐
   │  overlay()   │   │  narrate_with_granite()           │
-  │  40 % red    │   │  • build structured prompt        │
+  │  40 % red    │   │  • few-shot prompt (3 examples)   │
   │  blend PNG   │   │  • POST → watsonx.ai              │
   └──────────────┘   │    model: granite-3-8b-instruct   │
-                     │    max_new_tokens: 300             │
+                     │    max_new_tokens: 400             │
                      │    temperature: 0.2                │
-                     │  • classify change type            │
+                     │  • classify change type (9 labels) │
                      │  • state confidence + caveat       │
                      │  • template fallback if offline    │
                      └──────────────────────────────────┘
@@ -93,6 +139,10 @@ Given a **before** image and an **after** image of the same geographic area:
                                     ▼
                           Streamlit dashboard
                          (app.py — browser UI)
+                                    │
+                                    ▼
+                          catalogue.py (SQLite)
+                         ← Watsonx.data mirror →
 ```
 
 ### Key design decisions
@@ -101,10 +151,12 @@ Given a **before** image and an **after** image of the same geographic area:
 |---|---|
 | ORB + RANSAC over ECC | ORB is robust to non-uniform brightness shifts across satellite passes; ECC assumes photometric consistency |
 | Gaussian blur before threshold | Suppresses JPEG/sensor noise without morphological closing artefacts |
+| Few-shot prompt with 3 anchor examples | Dramatically improves label consistency vs zero-shot; examples span wildfire, urban growth, and noise magnitude |
 | Prompt encodes largest-region area | Single-band pixel count is ambiguous; spatial concentration changes the likely cause classification |
 | `temperature=0.2` | Low temperature produces consistent, factual classifications over creative paraphrasing |
 | Template fallback | Keeps the app fully functional at demo time without live credentials |
 | `@st.cache_data` on CV pipeline | Prevents expensive re-computation on every Streamlit re-render |
+| SCL cloud-mask union | Union of before+after SCL masks suppresses cloud/shadow pixels in *either* scene before thresholding |
 
 ---
 
@@ -126,17 +178,22 @@ lifecycle of TerraLens:
 - **Architecture design** — Bob proposed the ORB → RANSAC → absdiff → Granite
   pipeline and advised on the tradeoffs between ECC and feature-matching
   alignment approaches.
-- **Code generation** — all three Python modules (`change_detection.py`,
-  `narrate.py`, `app.py`) were written iteratively through Bob, with each
-  module generated from a precise natural-language specification.
-- **Prompt engineering** — Bob designed the structured three-part Granite prompt
-  (narrative / change-type classification / confidence + caveat) and advised on
-  setting `temperature=0.2` for consistent factual output.
+- **Code generation** — all Python modules were written iteratively through Bob,
+  with each module generated from a precise natural-language specification.
+- **Prompt engineering** — Bob designed the few-shot Granite prompt
+  (three labelled anchor examples + `Narrative / Change type / Confidence`
+  structured output) and advised on setting `temperature=0.2` for consistent
+  factual output.
 - **Debugging & refinement** — Bob identified that `st.cache_data` was needed
   to avoid re-running the CV pipeline on every Streamlit widget interaction,
   and corrected the BGR→RGB conversion path for the three-column image view.
-- **Documentation** — this README was drafted by Bob to satisfy the IBM AI
-  Builders challenge judge requirements.
+- **Feature expansion** — Bob implemented the complete Phase 2–4 roadmap:
+  NASA GIBS auto-fetch, Copernicus Sentinel-2 integration, SCL cloud-mask
+  filtering, automated scene scheduler, scene catalogue, false-colour
+  composites, swipe viewer, few-shot classifier, MCP tool server, and
+  quick-select preset landmark events.
+- **Documentation & tests** — this README and the 66-test pytest suite were
+  drafted by Bob to satisfy the IBM AI Builders challenge judge requirements.
 
 ---
 
@@ -159,17 +216,32 @@ bounding box.
 
 ### Prerequisites
 
-- Python 3.11+
+- Python 3.11+  **or** Docker (for the one-command option)
 - A watsonx.ai account with a project ID (optional — app runs offline without it)
 
-### Installation
+### Docker (one command) {#docker-one-command}
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/kellermanj2-eng/TerraLens.git
-cd terralens
+# Build and start (first run takes ~3 min to pull base image + install deps)
+docker compose up
 
-# 2. Create and activate a virtual environment
+# Background mode
+docker compose up -d
+
+# Stop
+docker compose down
+```
+
+Open http://localhost:8501.
+
+### Python installation
+
+```bash
+# 1. Clone
+git clone https://github.com/kellermanj2-eng/TerraLens.git
+cd TerraLens/terralens
+
+# 2. Virtual environment
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
@@ -177,7 +249,7 @@ source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### Set watsonx.ai credentials
+### Set credentials (all optional)
 
 ```bash
 cp .env.example .env
@@ -189,10 +261,13 @@ Edit `.env`:
 WATSONX_API_KEY=your_ibm_cloud_api_key
 WATSONX_PROJECT_ID=your_watsonx_project_id
 WATSONX_URL=https://us-south.ml.cloud.ibm.com
+
+CDSE_USER=your_copernicus_email@example.com
+CDSE_PASSWORD=your_copernicus_password
 ```
 
 If these variables are not set, TerraLens runs fully offline with a
-template-based narrative fallback.
+template-based narrative fallback and NASA GIBS imagery (no account required).
 
 ### Run the Streamlit dashboard
 
@@ -200,34 +275,47 @@ template-based narrative fallback.
 streamlit run app.py
 ```
 
-Open http://localhost:8501, upload a before/after image pair, adjust the
-threshold slider, and click **✨ Generate AI Narration**.
+Open http://localhost:8501.
 
 ### Run the CLI
 
 ```bash
 python change_detection.py \
-  --before  data/before.tif \
-  --after   data/after.tif  \
+  --before  data/sample_before.png \
+  --after   data/sample_after.png  \
   --out     results/overlay.png \
   --threshold 40
 ```
 
-Stats are printed to stdout as formatted JSON:
+### Run the automated scheduler
 
-```json
-{
-  "changed_fraction": 0.073,
-  "change_percent": 7.3,
-  "changed_pixels": 48203,
-  "total_pixels": 660000,
-  "num_regions": 12,
-  "top_regions": [
-    { "x": 142, "y": 88, "w": 310, "h": 204, "area_px": 47821 },
-    ...
-  ]
-}
+```bash
+# Register an AOI to monitor
+python scheduler.py --add-aoi \
+    --name "Amazon Watch" --source sentinel2 \
+    --bbox "-63.5,-11.0,-62.0,-9.5" --max-cloud 30
+
+# Poll all AOIs once (cron-friendly)
+python scheduler.py
+
+# Run as a daemon (polls every 6 hours)
+python scheduler.py --daemon --interval 360
 ```
+
+---
+
+## Test Suite
+
+```bash
+pytest tests/ -v
+# 66 tests, ~6 seconds, fully offline
+```
+
+Coverage:
+- `tests/test_change_detection.py` — CV pipeline: detect_change, overlay, GeoJSON, NDVI, false-colour
+- `tests/test_catalogue.py` — SQLite catalogue: CRUD, filtering, stats
+- `tests/test_narrate.py` — prompt construction, template fallback, classifier output parsing
+- `tests/test_scheduler.py` — AOI management: add, list, enable/disable, delete, poll lifecycle
 
 ---
 
@@ -247,28 +335,25 @@ Stats are printed to stdout as formatted JSON:
 
 ### Phase 2 — Live Satellite Image Acquisition ✅ Complete
 
-The goal of this phase is to eliminate the manual upload step entirely.
-Users will enter a location and date range; TerraLens fetches the imagery automatically.
-
 | Status | Feature | Notes |
 |--------|---------|-------|
-| ✅ Done | **NASA Worldview / GIBS auto-fetch** — `satellite_fetch.py` queries NASA CMR + stitches GIBS WMTS tiles; **no account required** | MODIS Terra (daily) and Landsat annual composites via [NASA GIBS](https://worldview.earthdata.nasa.gov/) |
-| ✅ Done | **Map-based AOI picker** — Leaflet.js draw widget in Fetch mode; coordinate bbox fallback; session-state persisted across reruns | Powered by `streamlit-folium` + `folium.plugins.Draw` |
-| ✅ Done | **MCP satellite tool server** — `mcp_server.py` exposes `search_satellite_scenes`, `fetch_scene_pair`, `run_change_detection`, `narrate_change` as MCP tools | Register with: `bob mcp add --name terralens --command "python mcp_server.py"` |
-| ✅ Done | **Copernicus / Sentinel-2 integration** — `sentinel2_fetch.py` searches CDSE OData catalogue (no auth) and downloads 10 m L2A band stacks (CDSE_USER/CDSE_PASSWORD); third mode in app.py with AOI map, cloud-cover filter, band selector, and credential badge; `search_sentinel2_scenes` + `fetch_sentinel2_pair` MCP tools added | Free registration at [dataspace.copernicus.eu](https://dataspace.copernicus.eu/) required |
-| ✅ Done | **Automated scene scheduling** — `scheduler.py`; `watched_aois` SQLite table; `poll_once()` / `run_daemon()` loop; downloads pair, runs change detection + narration, writes plain-text report, saves to catalogue; CLI (`--add-aoi`, `--daemon`, `--list-aois`); `schedule_aoi` + `list_watched_aois` MCP tools; "Watch this AOI" UI in app | Sentinel-2 5-day revisit cadence |
-| ✅ Done | **Cloud-mask filtering** — `include_scl=True` wired through `fetch_sentinel2_pair` → `download_sentinel2_scene`; SCL paths stored in session state; union cloud mask fed to `detect_change(cloud_mask=…)`; "Cloud masked %" metric in stats row; ☁️ toggle in Sentinel-2 sidebar | Reduces false-positive change detections in scenes with partial cloud cover |
+| ✅ Done | **NASA Worldview / GIBS auto-fetch** | MODIS Terra (daily) and Landsat annual composites via [NASA GIBS](https://worldview.earthdata.nasa.gov/) — no account required |
+| ✅ Done | **Map-based AOI picker** | Leaflet.js draw widget; coordinate bbox fallback; session-state persisted |
+| ✅ Done | **MCP satellite tool server** | `mcp_server.py` — register with `bob mcp add --name terralens --command "python mcp_server.py"` |
+| ✅ Done | **Copernicus / Sentinel-2 integration** | `sentinel2_fetch.py`; 10 m L2A; CDSE_USER/CDSE_PASSWORD; `search_sentinel2_scenes` + `fetch_sentinel2_pair` MCP tools |
+| ✅ Done | **Automated scene scheduling** | `scheduler.py`; `watched_aois` SQLite table; `poll_once()` / `run_daemon()`; `schedule_aoi` + `list_watched_aois` MCP tools |
+| ✅ Done | **Cloud-mask filtering** | SCL sidecar wired through pipeline; union mask fed to `detect_change(cloud_mask=…)`; ☁️ toggle in sidebar |
 
 ---
 
-### Phase 3 — Analysis Depth
+### Phase 3 — Analysis Depth ✅ Complete
 
 | Status | Feature |
 |--------|---------|
-| ✅ Done | Multi-temporal analysis — date-series input → consecutive-pair change % → `st.line_chart` trend |
-| ✅ Done | GeoJSON export of changed-region bounding boxes (`regions_to_geojson()` in `change_detection.py`) |
-| ✅ Done | Change area in real-world km² — computed from bbox lon/lat span, shown in metrics row |
-| ✅ Done | NDVI differencing for vegetation health — `compute_ndvi_diff()` in `change_detection.py`; diverging RdYlGn change map + gain/loss metrics in `app.py`; configurable NIR/Red band indices (Sentinel-2 defaults: band 8/4; Landsat 8: band 5/4) |
+| ✅ Done | Multi-temporal analysis — date-series → consecutive-pair change % → `st.line_chart` trend |
+| ✅ Done | GeoJSON export of changed-region bounding boxes |
+| ✅ Done | Change area in real-world km² |
+| ✅ Done | NDVI differencing — diverging RdYlGn change map + gain/loss metrics |
 
 ---
 
@@ -276,10 +361,22 @@ Users will enter a location and date range; TerraLens fetches the imagery automa
 
 | Status | Feature |
 |--------|---------|
-| ✅ Done | **Few-shot Granite classifier** — `narrate.py` upgraded with three labelled examples that anchor the taxonomy, structured `Narrative / Change type / Confidence` output parsed into a classified dict; classifier badge shown in app UI; `agricultural change` label added |
-| ✅ Done | **Side-by-side swipe viewer** — drag-divider before/after comparison embedded in the Streamlit dashboard (`app.py`) |
-| ✅ Done | **Scene catalogue** — `catalogue.py` persists every narrated analysis to a local SQLite database; `list_catalogue` and `get_catalogue_entry` MCP tools; searchable dataframe in app UI; Watsonx.data JDBC mirror hook via `WATSONX_DATA_CONNECTION_URL` env var |
-| ✅ Done | **Multi-spectral false-colour composites** — `compute_false_colour()` in `change_detection.py` with 5 presets (CIR, Urban/SWIR, Agriculture, Geology, Bathymetric); side-by-side before/after composite view + download in app |
+| ✅ Done | **Few-shot Granite classifier** — 3 anchor examples; structured Narrative/Change type/Confidence output; 9-label taxonomy |
+| ✅ Done | **Side-by-side swipe viewer** — drag-divider before/after comparison |
+| ✅ Done | **Scene catalogue** — SQLite persistence; Watsonx.data JDBC mirror hook; browse/filter UI |
+| ✅ Done | **Multi-spectral false-colour composites** — 5 presets (CIR, Urban/SWIR, Agriculture, Geology, Bathymetric) |
+
+---
+
+### Submission Extras ✅ Complete
+
+| Status | Item |
+|--------|------|
+| ✅ Done | **Docker** — `Dockerfile` + `docker-compose.yml`; one-command startup |
+| ✅ Done | **Sample images** — `data/sample_before.png` + `data/sample_after.png` bundled in repo |
+| ✅ Done | **Test suite** — 66 pytest tests, fully offline, < 10 s runtime |
+| ✅ Done | **Quick-select preset events** — 16 landmark events pre-loaded (8 NASA, 8 Sentinel-2) |
+| ✅ Done | **MCP tools** — 10 tools total: search, fetch, analyse, narrate, catalogue, scheduler |
 
 ---
 
@@ -289,5 +386,5 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-*Built for the IBM AI Builders August Challenge — Space Exploration theme.*  
+*Built for the IBM AI Builders August Challenge — Space Exploration theme.*
 *Satellite imagery courtesy of the European Space Agency (Copernicus) and NASA.*

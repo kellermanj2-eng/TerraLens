@@ -10,3 +10,5 @@ folium
 streamlit-folium
 mcp
 matplotlib
+pandas
+pytest

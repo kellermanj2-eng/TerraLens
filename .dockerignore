@@ -1,0 +1,27 @@
+# Git / Python
+.git/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+
+# Large runtime outputs (mounted as volumes)
+results/
+data/*.png
+data/*.jpg
+data/*.tif
+data/*.tiff
+
+# Editor artefacts
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
