@@ -24,6 +24,26 @@ save_results(mask, overlay_img, output_dir)
 run_pipeline(before_path, after_path, ...)
     Convenience end-to-end function used by app.py.
 
+compute_ndvi_diff(before_path, after_path, nir_band=8, red_band=4)
+    Compute per-pixel NDVI for before and after GeoTIFF images using the
+    specified NIR and Red band indices (1-based, Sentinel-2 defaults).
+    Returns (ndvi_before, ndvi_after, ndvi_diff, stats) where ndvi_diff is a
+    float32 array in [-2, 2] and stats contains mean/std/gain/loss summaries.
+
+compute_false_colour(path, r_band, g_band, b_band)
+    Render a false-colour composite from any three bands of a multi-band
+    GeoTIFF and return a uint8 RGB array suitable for display.
+    Preset mappings are provided for common analysis composites
+    (CIR, Urban/SWIR, Agriculture, Geology, Bathymetric/Shallow water).
+
+apply_scl_mask(scl_path, target_shape)
+    Read a Sentinel-2 Scene Classification Layer (SCL) GeoTIFF and return a
+    uint8 exclusion mask (255 = pixel should be ignored, 0 = usable).
+    Cloud, cloud shadow, saturated, and snow pixels are masked.
+
+cloud_mask_fraction(cloud_mask)
+    Return the fraction of pixels flagged as unusable in a cloud mask array.
+
 CLI
 ~~~
     python change_detection.py --before before.tif --after after.tif \\
@@ -233,6 +253,7 @@ def detect_change(
     after: np.ndarray,
     threshold: int = 40,
     min_area: int = 200,
+    cloud_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict]:
     """
     Detect changed pixels between *before* and *after* images.
@@ -241,12 +262,14 @@ def detect_change(
     --------
     1. Convert both images to grayscale.
     2. Compute per-pixel absolute difference.
-    3. Apply a 5×5 Gaussian blur to suppress high-frequency sensor noise.
-    4. Binary-threshold the blurred difference at *threshold*.
-    5. Morphological opening (3×3 ellipse, 2 iterations) removes isolated
+    3. If *cloud_mask* is provided, zero out masked pixels in the diff so
+       cloud/shadow regions cannot trigger false-positive detections.
+    4. Apply a 5×5 Gaussian blur to suppress high-frequency sensor noise.
+    5. Binary-threshold the blurred difference at *threshold*.
+    6. Morphological opening (3×3 ellipse, 2 iterations) removes isolated
        salt-and-pepper specks while preserving region shapes.
-    6. Extract external contours; discard any whose bounding area < *min_area*.
-    7. Render the final binary mask from kept contours.
+    7. Extract external contours; discard any whose bounding area < *min_area*.
+    8. Render the final binary mask from kept contours.
 
     Parameters
     ----------
@@ -255,6 +278,11 @@ def detect_change(
                     considered changed.  Lower → more sensitive.
     min_area      : Minimum contour area (px²) to retain.  Smaller blobs
                     are discarded as sensor / compression noise.
+    cloud_mask    : Optional uint8 exclusion mask (255 = masked / unusable,
+                    0 = clear), same spatial shape as *before*.  Typically
+                    produced by apply_scl_mask().  Masked pixels are zeroed
+                    in the difference image before thresholding, preventing
+                    clouds and shadows from being flagged as real changes.
 
     Returns
     -------
@@ -265,7 +293,9 @@ def detect_change(
         regions           list   top-10 regions by area, each a dict:
                                    x, y, w, h  (bounding-box origin + size)
                                    area_px     (contour area in pixels)
-        # legacy keys kept for app.py compatibility:
+        cloud_masked_pct  float  percentage of pixels excluded by cloud mask
+                                 (0.0 if no mask was supplied)
+        # legacy keys kept for app.py / narrate.py compatibility:
         total_pixels      int
         changed_pixels    int
         change_percent    float
@@ -276,6 +306,19 @@ def detect_change(
 
     # --- Absolute difference ---
     diff = cv2.absdiff(before_gray, after_gray)
+
+    # --- Cloud mask suppression (zero out unreliable pixels before threshold) ---
+    cloud_masked_pct = 0.0
+    if cloud_mask is not None:
+        cm = cloud_mask
+        # Resize mask to match diff if SCL was resampled at a different resolution
+        if cm.shape != diff.shape:
+            cm = cv2.resize(cm, (diff.shape[1], diff.shape[0]),
+                            interpolation=cv2.INTER_NEAREST)
+        diff[cm == 255] = 0
+        cloud_masked_pct = round(
+            float(np.count_nonzero(cm == 255)) / cm.size * 100, 2
+        )
 
     # --- Gaussian blur (reduce sensor noise before thresholding) ---
     diff_blur = cv2.GaussianBlur(diff, (5, 5), 0)
@@ -316,9 +359,11 @@ def detect_change(
 
     stats = {
         # primary keys (requested spec)
-        "changed_fraction": round(changed_px / total_px, 6) if total_px else 0.0,
-        "num_regions":      len(kept),
-        "regions":          top_regions,
+        "changed_fraction":  round(changed_px / total_px, 6) if total_px else 0.0,
+        "num_regions":       len(kept),
+        "regions":           top_regions,
+        # cloud-masking report
+        "cloud_masked_pct":  cloud_masked_pct,
         # legacy keys (used by app.py / narrate.py)
         "total_pixels":    total_px,
         "changed_pixels":  changed_px,
@@ -392,6 +437,323 @@ def regions_to_geojson(
         })
 
     return {"type": "FeatureCollection", "features": features}
+
+
+# ---------------------------------------------------------------------------
+# Sentinel-2 cloud masking  (SCL — Scene Classification Layer)
+# ---------------------------------------------------------------------------
+
+# SCL pixel class values that should be excluded from change detection.
+# Reference: Sentinel-2 Level-2A Algorithm Theoretical Basis Document (ATBD)
+#   0  NO_DATA
+#   1  SATURATED_OR_DEFECTIVE
+#   3  CLOUD_SHADOWS
+#   8  CLOUD_MEDIUM_PROBABILITY
+#   9  CLOUD_HIGH_PROBABILITY
+#  10  THIN_CIRRUS
+#  11  SNOW_ICE  (optional — keep False to preserve snow-change detection)
+_SCL_CLOUD_CLASSES = frozenset([0, 1, 3, 8, 9, 10])
+_SCL_SNOW_CLASS    = 11   # masked separately so callers can opt out
+
+
+def apply_scl_mask(
+    scl_path: str,
+    target_shape: tuple[int, int],
+    mask_snow: bool = False,
+) -> tuple[np.ndarray, dict]:
+    """
+    Read a Sentinel-2 SCL (Scene Classification Layer) GeoTIFF and produce a
+    binary exclusion mask for use with detect_change().
+
+    SCL classes masked unconditionally (cloud_classes):
+        0  NO_DATA
+        1  SATURATED / DEFECTIVE
+        3  CLOUD SHADOWS
+        8  CLOUD MEDIUM PROBABILITY
+        9  CLOUD HIGH PROBABILITY
+       10  THIN CIRRUS
+
+    SCL class masked when *mask_snow* is True:
+       11  SNOW / ICE
+
+    Parameters
+    ----------
+    scl_path     : Path to the SCL GeoTIFF (single-band, uint8 class values).
+    target_shape : (height, width) of the image the mask will be applied to.
+                   The SCL band (20 m) is resampled to this resolution with
+                   nearest-neighbour interpolation if necessary.
+    mask_snow    : If True, also mask class 11 (snow/ice).  Default False —
+                   snow cover changes are often real events worth detecting.
+
+    Returns
+    -------
+    cloud_mask : uint8 array, shape *target_shape*.
+                 255 = pixel excluded (cloud / shadow / no-data / snow).
+                 0   = pixel usable (clear land, water, vegetation).
+    scl_stats  : dict with keys —
+        cloud_fraction  float  fraction of pixels in cloud_classes (0-1)
+        snow_fraction   float  fraction of class-11 pixels (0-1)
+        masked_fraction float  total fraction masked (includes snow if mask_snow)
+        masked_pct      float  masked_fraction × 100 (convenience)
+
+    Raises
+    ------
+    FileNotFoundError if *scl_path* does not exist.
+    ValueError        if the file cannot be opened as a single-band raster.
+    """
+    if not os.path.exists(scl_path):
+        raise FileNotFoundError(f"SCL file not found: {scl_path}")
+
+    with rasterio.open(scl_path) as src:
+        scl = src.read(1)   # uint8 class values, shape (H_scl, W_scl)
+
+    h, w = target_shape
+
+    # Resample to target resolution (nearest-neighbour preserves class integers)
+    if scl.shape != (h, w):
+        scl = cv2.resize(scl.astype(np.uint8), (w, h),
+                         interpolation=cv2.INTER_NEAREST)
+
+    total = scl.size
+
+    # Build boolean masks for each group
+    cloud_bool = np.isin(scl, list(_SCL_CLOUD_CLASSES))
+    snow_bool  = (scl == _SCL_SNOW_CLASS)
+
+    exclude_bool = cloud_bool | (snow_bool if mask_snow else np.zeros_like(cloud_bool))
+
+    cloud_mask = np.where(exclude_bool, np.uint8(255), np.uint8(0))
+
+    scl_stats = {
+        "cloud_fraction":  round(float(cloud_bool.sum()) / total, 6),
+        "snow_fraction":   round(float(snow_bool.sum())  / total, 6),
+        "masked_fraction": round(float(exclude_bool.sum()) / total, 6),
+        "masked_pct":      round(float(exclude_bool.sum()) / total * 100, 2),
+    }
+
+    return cloud_mask, scl_stats
+
+
+def cloud_mask_fraction(cloud_mask: np.ndarray) -> float:
+    """
+    Return the fraction of pixels set to 255 (excluded) in *cloud_mask*.
+
+    Parameters
+    ----------
+    cloud_mask : uint8 array as returned by apply_scl_mask().
+
+    Returns
+    -------
+    float in [0, 1].
+    """
+    return float(np.count_nonzero(cloud_mask == 255)) / cloud_mask.size
+
+
+# ---------------------------------------------------------------------------
+# NDVI differencing  (Sentinel-2 NIR / Red bands)
+# ---------------------------------------------------------------------------
+
+def _read_band_float(path: str, band_index: int) -> np.ndarray:
+    """
+    Read a single band from a GeoTIFF as a float32 array (H, W).
+
+    Parameters
+    ----------
+    path       : path to the GeoTIFF.
+    band_index : 1-based band number (Sentinel-2 convention:
+                 band 4 = Red, band 8 = NIR).
+
+    Raises
+    ------
+    ValueError  if the file has fewer bands than *band_index*.
+    """
+    with rasterio.open(path) as src:
+        if band_index > src.count:
+            raise ValueError(
+                f"Band {band_index} requested but '{os.path.basename(path)}' "
+                f"only has {src.count} band(s).  "
+                "NDVI requires a multi-band GeoTIFF with NIR and Red bands "
+                "(Sentinel-2 band 8 = NIR, band 4 = Red)."
+            )
+        data = src.read(band_index).astype(np.float32)
+    return data
+
+
+def _ndvi(nir: np.ndarray, red: np.ndarray) -> np.ndarray:
+    """
+    Compute NDVI = (NIR − Red) / (NIR + Red).
+
+    Pixels where NIR + Red == 0 receive NDVI = 0 to avoid division errors.
+    Output is clipped to [-1, 1] and returned as float32.
+    """
+    denom = nir + red
+    with np.errstate(invalid="ignore", divide="ignore"):
+        result = np.where(denom != 0, (nir - red) / denom, 0.0)
+    return np.clip(result, -1.0, 1.0).astype(np.float32)
+
+
+def compute_ndvi_diff(
+    before_path: str,
+    after_path: str,
+    nir_band: int = 8,
+    red_band: int = 4,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """
+    Compute NDVI for *before* and *after* GeoTIFF images and return the
+    signed per-pixel difference (after − before).
+
+    Default band assignments follow the Sentinel-2 L2A convention:
+        band 4 = Red (664 nm)
+        band 8 = NIR (833 nm)
+    Adjust *nir_band* / *red_band* for other sensors (e.g. Landsat 8:
+    nir_band=5, red_band=4).
+
+    Parameters
+    ----------
+    before_path : path to the earlier GeoTIFF (must have ≥ max(nir_band, red_band) bands).
+    after_path  : path to the later  GeoTIFF.
+    nir_band    : 1-based index of the Near-Infrared band.
+    red_band    : 1-based index of the Red band.
+
+    Returns
+    -------
+    ndvi_before : float32 array (H, W), NDVI of the earlier image.
+    ndvi_after  : float32 array (H, W), NDVI of the later image.
+    ndvi_diff   : float32 array (H, W), signed change (after − before), range [-2, 2].
+    stats       : dict with summary keys —
+        mean_ndvi_before  float  scene-wide mean NDVI before
+        mean_ndvi_after   float  scene-wide mean NDVI after
+        mean_ndvi_diff    float  mean signed change
+        std_ndvi_diff     float  standard deviation of the change
+        gain_fraction     float  fraction of pixels with NDVI increase > +0.05
+        loss_fraction     float  fraction of pixels with NDVI decrease < -0.05
+        gain_area_pct     float  gain_fraction as percentage (convenience)
+        loss_area_pct     float  loss_fraction as percentage (convenience)
+
+    Raises
+    ------
+    ValueError  if either file is not a GeoTIFF or lacks the required bands.
+    """
+    for path in (before_path, after_path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".tif", ".tiff"):
+            raise ValueError(
+                f"NDVI differencing requires GeoTIFF input; got '{os.path.basename(path)}'."
+            )
+
+    nir_b = _read_band_float(before_path, nir_band)
+    red_b = _read_band_float(before_path, red_band)
+    nir_a = _read_band_float(after_path,  nir_band)
+    red_a = _read_band_float(after_path,  red_band)
+
+    # Resize after-bands to match before if necessary (mirrors load_and_align logic)
+    if nir_a.shape != nir_b.shape:
+        h, w = nir_b.shape
+        nir_a = cv2.resize(nir_a, (w, h), interpolation=cv2.INTER_AREA)
+        red_a = cv2.resize(red_a, (w, h), interpolation=cv2.INTER_AREA)
+
+    ndvi_before = _ndvi(nir_b, red_b)
+    ndvi_after  = _ndvi(nir_a, red_a)
+    ndvi_diff   = (ndvi_after - ndvi_before).astype(np.float32)
+
+    total = ndvi_diff.size
+    gain  = int(np.count_nonzero(ndvi_diff >  0.05))
+    loss  = int(np.count_nonzero(ndvi_diff < -0.05))
+
+    stats = {
+        "mean_ndvi_before": round(float(np.nanmean(ndvi_before)), 4),
+        "mean_ndvi_after":  round(float(np.nanmean(ndvi_after)),  4),
+        "mean_ndvi_diff":   round(float(np.nanmean(ndvi_diff)),   4),
+        "std_ndvi_diff":    round(float(np.nanstd(ndvi_diff)),    4),
+        "gain_fraction":    round(gain / total, 6) if total else 0.0,
+        "loss_fraction":    round(loss / total, 6) if total else 0.0,
+        "gain_area_pct":    round(gain / total * 100, 2) if total else 0.0,
+        "loss_area_pct":    round(loss / total * 100, 2) if total else 0.0,
+    }
+
+    return ndvi_before, ndvi_after, ndvi_diff, stats
+
+
+# ---------------------------------------------------------------------------
+# False-colour composites
+# ---------------------------------------------------------------------------
+
+# Preset composite definitions: name → (r_band, g_band, b_band, description)
+# Band indices are 1-based Sentinel-2 L2A defaults; the UI lets users override.
+FALSE_COLOUR_PRESETS: dict[str, tuple[int, int, int, str]] = {
+    "CIR (Colour Infrared — vegetation)":  (8, 4, 3, "NIR→R, Red→G, Green→B. Healthy vegetation appears vivid red. Ideal for detecting deforestation, crop stress, and fire scars."),
+    "Urban / SWIR":                         (12, 11, 4, "SWIR-2→R, SWIR-1→G, Red→B. Built-up areas show up in bright cyan/white; bare soil is brown; vegetation is green."),
+    "Agriculture":                          (11, 8, 4, "SWIR-1→R, NIR→G, Red→B. Crops appear bright green; fallow land is brown; water is dark blue."),
+    "Geology / Bare soil":                  (12, 11, 2, "SWIR-2→R, SWIR-1→G, Blue→B. Highlights exposed rock, sand, and soil types by mineral absorption differences."),
+    "Bathymetric / Shallow water":          (4, 3, 1, "Red→R, Green→G, Coastal aerosol→B. Enhances water depth gradients and coastal sediment in shallow seas."),
+}
+
+
+def compute_false_colour(
+    path: str,
+    r_band: int,
+    g_band: int,
+    b_band: int,
+) -> np.ndarray:
+    """
+    Build a false-colour RGB composite from three bands of a multi-band GeoTIFF.
+
+    Each band is read, normalised to the 2nd–98th percentile range of that
+    band's pixel distribution (robust stretch), and mapped to [0, 255] uint8.
+    This matches the display behaviour of tools like QGIS and EO Browser.
+
+    Parameters
+    ----------
+    path   : Path to the multi-band GeoTIFF (e.g. a Sentinel-2 L2A stack).
+    r_band : 1-based band index assigned to the Red channel.
+    g_band : 1-based band index assigned to the Green channel.
+    b_band : 1-based band index assigned to the Blue channel.
+
+    Returns
+    -------
+    rgb : uint8 ndarray of shape (H, W, 3) in RGB order, ready for
+          ``st.image()`` or ``cv2.imwrite()``.
+
+    Raises
+    ------
+    FileNotFoundError  if *path* does not exist.
+    ValueError         if the file has fewer bands than the highest requested index,
+                       or if the file is not a valid GeoTIFF.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Image not found: {path}")
+
+    with rasterio.open(path) as src:
+        n_bands = src.count
+        needed  = max(r_band, g_band, b_band)
+        if needed > n_bands:
+            raise ValueError(
+                f"Composite requires band {needed} but '{os.path.basename(path)}' "
+                f"only has {n_bands} band(s).  "
+                "Choose a preset that fits your file's band count, or use a "
+                "Sentinel-2 L2A stack with all 12 reflectance bands."
+            )
+
+        def _read_norm(band_idx: int) -> np.ndarray:
+            """Read a band and apply a 2–98 percentile robust linear stretch."""
+            data = src.read(band_idx).astype(np.float32)
+            lo, hi = np.percentile(data[data > 0], [2, 98]) if np.any(data > 0) else (0.0, 1.0)
+            if hi <= lo:
+                hi = lo + 1.0
+            normed = np.clip((data - lo) / (hi - lo), 0.0, 1.0)
+            return (normed * 255).astype(np.uint8)
+
+        r = _read_norm(r_band)
+        g = _read_norm(g_band)
+        b = _read_norm(b_band)
+
+    # Resize g and b to r dimensions if they differ (rare — different resolution bands)
+    if g.shape != r.shape:
+        g = cv2.resize(g, (r.shape[1], r.shape[0]), interpolation=cv2.INTER_AREA)
+    if b.shape != r.shape:
+        b = cv2.resize(b, (r.shape[1], r.shape[0]), interpolation=cv2.INTER_AREA)
+
+    return np.dstack([r, g, b])  # (H, W, 3) uint8 RGB
 
 
 # ---------------------------------------------------------------------------

@@ -9,3 +9,4 @@ Pillow
 folium
 streamlit-folium
 mcp
+matplotlib

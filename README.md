@@ -245,7 +245,7 @@ Stats are printed to stdout as formatted JSON:
 
 ---
 
-### Phase 2 — Live Satellite Image Acquisition 🔜 Next
+### Phase 2 — Live Satellite Image Acquisition ✅ Complete
 
 The goal of this phase is to eliminate the manual upload step entirely.
 Users will enter a location and date range; TerraLens fetches the imagery automatically.
@@ -255,9 +255,9 @@ Users will enter a location and date range; TerraLens fetches the imagery automa
 | ✅ Done | **NASA Worldview / GIBS auto-fetch** — `satellite_fetch.py` queries NASA CMR + stitches GIBS WMTS tiles; **no account required** | MODIS Terra (daily) and Landsat annual composites via [NASA GIBS](https://worldview.earthdata.nasa.gov/) |
 | ✅ Done | **Map-based AOI picker** — Leaflet.js draw widget in Fetch mode; coordinate bbox fallback; session-state persisted across reruns | Powered by `streamlit-folium` + `folium.plugins.Draw` |
 | ✅ Done | **MCP satellite tool server** — `mcp_server.py` exposes `search_satellite_scenes`, `fetch_scene_pair`, `run_change_detection`, `narrate_change` as MCP tools | Register with: `bob mcp add --name terralens --command "python mcp_server.py"` |
-| 🔜 Near-term | **Copernicus / Sentinel-2 integration** — optionally add CDSE OData search for higher-resolution (10 m) Sentinel-2 L2A scenes | Free registration at [dataspace.copernicus.eu](https://dataspace.copernicus.eu/) required |
-| 🔮 Future | **Automated scene scheduling** — cron-style job that polls for new acquisitions over saved AOIs and triggers change detection + narration automatically | Sentinel-2 5-day revisit cadence |
-| 🔮 Future | **Cloud-mask filtering** — use Sentinel-2 SCL band or NASA Fmask to reject cloudy scenes before comparison | Reduces false-positive change detections |
+| ✅ Done | **Copernicus / Sentinel-2 integration** — `sentinel2_fetch.py` searches CDSE OData catalogue (no auth) and downloads 10 m L2A band stacks (CDSE_USER/CDSE_PASSWORD); third mode in app.py with AOI map, cloud-cover filter, band selector, and credential badge; `search_sentinel2_scenes` + `fetch_sentinel2_pair` MCP tools added | Free registration at [dataspace.copernicus.eu](https://dataspace.copernicus.eu/) required |
+| ✅ Done | **Automated scene scheduling** — `scheduler.py`; `watched_aois` SQLite table; `poll_once()` / `run_daemon()` loop; downloads pair, runs change detection + narration, writes plain-text report, saves to catalogue; CLI (`--add-aoi`, `--daemon`, `--list-aois`); `schedule_aoi` + `list_watched_aois` MCP tools; "Watch this AOI" UI in app | Sentinel-2 5-day revisit cadence |
+| ✅ Done | **Cloud-mask filtering** — `include_scl=True` wired through `fetch_sentinel2_pair` → `download_sentinel2_scene`; SCL paths stored in session state; union cloud mask fed to `detect_change(cloud_mask=…)`; "Cloud masked %" metric in stats row; ☁️ toggle in Sentinel-2 sidebar | Reduces false-positive change detections in scenes with partial cloud cover |
 
 ---
 
@@ -268,18 +268,18 @@ Users will enter a location and date range; TerraLens fetches the imagery automa
 | ✅ Done | Multi-temporal analysis — date-series input → consecutive-pair change % → `st.line_chart` trend |
 | ✅ Done | GeoJSON export of changed-region bounding boxes (`regions_to_geojson()` in `change_detection.py`) |
 | ✅ Done | Change area in real-world km² — computed from bbox lon/lat span, shown in metrics row |
-| 🔜 Near-term | NDVI differencing for vegetation health using Sentinel-2 NIR bands |
+| ✅ Done | NDVI differencing for vegetation health — `compute_ndvi_diff()` in `change_detection.py`; diverging RdYlGn change map + gain/loss metrics in `app.py`; configurable NIR/Red band indices (Sentinel-2 defaults: band 8/4; Landsat 8: band 5/4) |
 
 ---
 
-### Phase 4 — AI & Visualisation 🔮 Future
+### Phase 4 — AI & Visualisation ✅ Complete
 
 | Status | Feature |
 |--------|---------|
-| 🔮 Future | Fine-tuned Granite classifier trained on labelled satellite change events |
-| 🔮 Future | Side-by-side swipe viewer with Leaflet.js map overlay |
-| 🔮 Future | Watsonx.data integration for image catalogue management and retrieval |
-| 🔮 Future | Multi-spectral false-colour composites (NIR / SWIR band combinations) |
+| ✅ Done | **Few-shot Granite classifier** — `narrate.py` upgraded with three labelled examples that anchor the taxonomy, structured `Narrative / Change type / Confidence` output parsed into a classified dict; classifier badge shown in app UI; `agricultural change` label added |
+| ✅ Done | **Side-by-side swipe viewer** — drag-divider before/after comparison embedded in the Streamlit dashboard (`app.py`) |
+| ✅ Done | **Scene catalogue** — `catalogue.py` persists every narrated analysis to a local SQLite database; `list_catalogue` and `get_catalogue_entry` MCP tools; searchable dataframe in app UI; Watsonx.data JDBC mirror hook via `WATSONX_DATA_CONNECTION_URL` env var |
+| ✅ Done | **Multi-spectral false-colour composites** — `compute_false_colour()` in `change_detection.py` with 5 presets (CIR, Urban/SWIR, Agriculture, Geology, Bathymetric); side-by-side before/after composite view + download in app |
 
 ---
 

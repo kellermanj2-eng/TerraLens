@@ -37,7 +37,7 @@ load_dotenv()  # reads .env if present
 _MODEL_ID   = "ibm/granite-3-8b-instruct"
 _DEFAULT_URL = "https://us-south.ml.cloud.ibm.com"
 _GEN_PARAMS = {
-    "max_new_tokens": 300,
+    "max_new_tokens": 400,
     "temperature":    0.2,
 }
 
@@ -50,8 +50,33 @@ _CHANGE_TYPES = (
     "glacier retreat",
     "drought / vegetation loss",
     "coastal erosion",
+    "agricultural change",
     "unknown",
 )
+
+# ---------------------------------------------------------------------------
+# Few-shot examples  (used to anchor the classifier)
+# ---------------------------------------------------------------------------
+
+_FEW_SHOT_EXAMPLES = """\
+### Example 1
+Scene change: 18.4% (121,440 / 660,000 px) | Regions: 3 | Largest: 98,210 px²
+Narrative: A large contiguous area of surface reflectance changed dramatically, concentrated in three patches that together cover nearly a fifth of the scene. The spatial compactness and high intensity are consistent with a wildfire burn scar that removed canopy abruptly between the two acquisition dates.
+Change type: wildfire
+Confidence: High — Spectral confirmation (SWIR increase, NIR drop) and field survey would verify the burn extent.
+
+### Example 2
+Scene change: 6.1% (40,260 / 660,000 px) | Regions: 14 | Largest: 8,100 px²
+Narrative: Changes are scattered across many small regions with no dominant cluster, suggesting incremental surface modifications rather than a single event. This fragmented pattern is typical of active construction, land clearing in peri-urban areas, or progressive agricultural expansion.
+Change type: urban growth
+Confidence: Medium — High-resolution imagery and cadastral records would distinguish urban construction from agricultural conversion.
+
+### Example 3
+Scene change: 0.9% (5,940 / 660,000 px) | Regions: 22 | Largest: 1,200 px²
+Narrative: Very minor surface change spread across numerous tiny regions. At this magnitude the signal is likely dominated by sensor noise, atmospheric correction artefacts, or minor phenological variation in vegetation.
+Change type: unknown
+Confidence: Low — The change magnitude is below the threshold where cause attribution is reliable; additional acquisition dates and multi-spectral bands are needed.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -60,55 +85,98 @@ _CHANGE_TYPES = (
 
 def _build_prompt(stats: dict, date_range: str) -> str:
     """
-    Assemble the instruction prompt sent to Granite.
+    Assemble the few-shot instruction prompt sent to Granite.
 
-    The prompt encodes the quantitative change statistics, the observation
-    window, and a structured task description so the model reliably produces
-    a classified, confidence-annotated narrative.
+    The prompt provides three labelled examples that anchor the classifier to
+    the taxonomy before presenting the target statistics, significantly
+    improving label consistency compared to a zero-shot prompt.
     """
     change_pct   = stats.get("change_percent",    0.0)
     num_regions  = stats.get("num_regions",        0)
     changed_px   = stats.get("changed_pixels",     0)
     total_px     = stats.get("total_pixels",        0)
     regions      = stats.get("regions",            [])
+    ndvi_hint    = stats.get("ndvi_hint",          "")
 
-    # Largest region area (first entry — detect_change sorts descending by area)
     largest_area = regions[0]["area_px"] if regions else 0
 
     context = (
-        f"Observation window : {date_range or 'unspecified'}\n"
-        f"Scene change        : {change_pct}% of total pixels ({changed_px:,} / {total_px:,})\n"
-        f"Distinct regions    : {num_regions}\n"
-        f"Largest region      : {largest_area:,} px²"
+        f"Scene change: {change_pct}% ({changed_px:,} / {total_px:,} px) | "
+        f"Regions: {num_regions} | Largest: {largest_area:,} px²"
     )
+
+    if ndvi_hint:
+        context += f"\nNDVI signal: {ndvi_hint}"
 
     change_type_list = "\n".join(f"  - {t}" for t in _CHANGE_TYPES)
 
-    prompt = f"""You are a professional satellite imagery analyst. \
-You have just run an automated change-detection algorithm that compared two \
-multispectral satellite images of the same geographic location captured at \
-different times. The algorithm flags pixels whose brightness changed by more \
-than a set threshold and groups them into contiguous regions.
+    prompt = f"""You are a professional satellite imagery analyst using a \
+few-shot classification system. Study the examples below, then classify the \
+target scene in exactly the same format.
 
-Below are the quantitative results:
+Valid change types:
+{change_type_list}
 
+---
+{_FEW_SHOT_EXAMPLES}
+---
+
+### Target scene
+Observation window: {date_range or 'unspecified'}
 {context}
 
-Your task:
-1. In 2-3 plain-English sentences, explain what likely changed on the ground \
-and what physical process could explain a change of this magnitude and \
-spatial pattern.
-2. On a new line, write "Change type: <label>" where <label> is the single \
-best-matching category from this list:
-{change_type_list}
-3. On a new line, write "Confidence: <Low|Medium|High>" based on how \
-unambiguous the statistics are, followed by a brief one-sentence caveat about \
-what additional data (e.g. spectral bands, field verification) would be needed \
-to confirm the classification.
-
-Write only the three parts described above — no preamble, no extra headers.
+Respond with exactly three lines:
+Narrative: <2-3 plain-English sentences explaining the most likely ground event>
+Change type: <single label from the list above>
+Confidence: <Low|Medium|High> — <one sentence: what additional data would confirm the classification>
 """
     return prompt.strip()
+
+
+# ---------------------------------------------------------------------------
+# Parse structured classifier output
+# ---------------------------------------------------------------------------
+
+def _parse_classifier_output(raw: str) -> dict:
+    """
+    Extract structured fields from Granite's response.
+
+    Returns a dict with keys: narrative, change_type, confidence, caveat.
+    Falls back gracefully if any field is missing.
+    """
+    import re
+    lines = [ln.strip() for ln in raw.strip().splitlines() if ln.strip()]
+
+    narrative   = ""
+    change_type = "unknown"
+    confidence  = "Low"
+    caveat      = ""
+
+    for line in lines:
+        if line.lower().startswith("narrative:"):
+            narrative = line[len("narrative:"):].strip()
+        elif line.lower().startswith("change type:"):
+            change_type = line[len("change type:"):].strip().lower()
+        elif line.lower().startswith("confidence:"):
+            rest = line[len("confidence:"):].strip()
+            # Split on " — " or " - " or first comma
+            m = re.match(r"^(low|medium|high)[^\w]*(.*)", rest, re.IGNORECASE)
+            if m:
+                confidence = m.group(1).capitalize()
+                caveat     = m.group(2).strip(" —-,")
+            else:
+                confidence = rest.split()[0].capitalize() if rest else "Low"
+
+    # If Granite returned a monolithic block without headers, keep it as narrative
+    if not narrative and lines:
+        narrative = " ".join(lines)
+
+    return {
+        "narrative":   narrative,
+        "change_type": change_type,
+        "confidence":  confidence,
+        "caveat":      caveat,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +244,7 @@ def _template_narrative(stats: dict, date_range: str) -> str:
 def narrate_with_granite(
     stats: dict,
     date_range: str = "",
-) -> tuple[str, str]:
+) -> tuple[str, str, dict]:
     """
     Generate a plain-language narrative for *stats*.
 
@@ -185,14 +253,17 @@ def narrate_with_granite(
     stats      : dict as returned by change_detection.detect_change().
                  Required keys: change_percent, num_regions, changed_pixels,
                  total_pixels, regions (list of region dicts).
+                 Optional key: ndvi_hint (str) — brief NDVI signal description
+                 forwarded into the few-shot prompt for richer classification.
     date_range : human-readable observation window, e.g. "Jan 2023 → Jul 2023".
                  Used in both the Granite prompt and the template fallback.
 
     Returns
     -------
-    (narrative: str, source: str)
-        source == "granite"  — response came from IBM Granite via watsonx.ai
-        source == "template" — deterministic fallback was used
+    (narrative: str, source: str, classified: dict)
+        source     == "granite"  — response came from IBM Granite via watsonx.ai
+        source     == "template" — deterministic fallback was used
+        classified == dict with keys: narrative, change_type, confidence, caveat
     """
     # Check credentials before attempting any network call
     api_key    = os.getenv("WATSONX_API_KEY",    "").strip()
@@ -200,7 +271,9 @@ def narrate_with_granite(
     url        = os.getenv("WATSONX_URL", _DEFAULT_URL).strip()
 
     if not api_key or not project_id:
-        return _template_narrative(stats, date_range), "template"
+        raw = _template_narrative(stats, date_range)
+        classified = _parse_classifier_output(raw)
+        return raw, "template", classified
 
     prompt = _build_prompt(stats, date_range)
 
@@ -216,20 +289,30 @@ def narrate_with_granite(
             params=_GEN_PARAMS,
         )
         response  = model.generate_text(prompt=prompt)
-        narrative = response.strip() if isinstance(response, str) else str(response).strip()
-        if narrative:
-            return narrative, "granite"
+        raw = response.strip() if isinstance(response, str) else str(response).strip()
+        if raw:
+            classified = _parse_classifier_output(raw)
+            # Reconstruct full narrative string from parsed fields for display
+            narrative = classified["narrative"] or raw
+            if classified["change_type"] and classified["change_type"] != "unknown":
+                narrative += f"\nChange type: {classified['change_type']}"
+            if classified["confidence"]:
+                caveat_str = f" — {classified['caveat']}" if classified["caveat"] else ""
+                narrative += f"\nConfidence: {classified['confidence']}{caveat_str}"
+            return narrative, "granite", classified
     except Exception:
         pass  # fall through to template
 
-    return _template_narrative(stats, date_range), "template"
+    raw = _template_narrative(stats, date_range)
+    classified = _parse_classifier_output(raw)
+    return raw, "template", classified
 
 
 # ---------------------------------------------------------------------------
 # Compatibility shim  (called by app.py as generate_narrative)
 # ---------------------------------------------------------------------------
 
-def generate_narrative(stats: dict, user_context: str = "") -> tuple[str, str]:
+def generate_narrative(stats: dict, user_context: str = "") -> tuple[str, str, dict]:
     """
     Thin wrapper kept for app.py compatibility.
 

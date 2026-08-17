@@ -15,6 +15,15 @@ search_satellite_scenes
 fetch_scene_pair
     Download a before/after GIBS tile mosaic for a location and dates.
 
+search_sentinel2_scenes
+    Search the Copernicus CDSE catalogue for Sentinel-2 L2A products.
+    No authentication required for catalogue search.
+
+fetch_sentinel2_pair
+    Download a before/after Sentinel-2 L2A pair (10 m resolution) from CDSE.
+    Requires CDSE_USER / CDSE_PASSWORD credentials (free account).
+    Output GeoTIFFs are multi-band and ready for NDVI via compute_ndvi_diff().
+
 run_change_detection
     Align two local image files and return change statistics.
 
@@ -235,6 +244,248 @@ def run_change_detection(
 
 
 # ---------------------------------------------------------------------------
+# Tool: search_sentinel2_scenes
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def search_sentinel2_scenes(
+    min_lon: float,
+    min_lat: float,
+    max_lon: float,
+    max_lat: float,
+    date_from: str,
+    date_to: str,
+    max_cloud_pct: float = 30.0,
+    limit: int = 5,
+) -> str:
+    """
+    Search the Copernicus Data Space Ecosystem (CDSE) catalogue for
+    Sentinel-2 L2A products within a bounding box and date range.
+
+    No authentication is required for catalogue search.
+
+    Parameters
+    ----------
+    min_lon, min_lat, max_lon, max_lat : WGS-84 bounding box in decimal degrees.
+    date_from     : Start date in YYYY-MM-DD format (e.g. "2024-01-01").
+    date_to       : End date   in YYYY-MM-DD format (e.g. "2024-06-30").
+    max_cloud_pct : Maximum acceptable cloud cover percentage (0-100). Default: 30.
+    limit         : Maximum number of results to return (default 5).
+
+    Returns
+    -------
+    JSON string listing matching Sentinel-2 scenes with date, name, cloud
+    cover %, and source.
+    """
+    from sentinel2_fetch import (
+        search_sentinel2_scenes as _search,
+        CopernicusSearchError,
+    )
+
+    bbox = (min_lon, min_lat, max_lon, max_lat)
+    try:
+        scenes = _search(bbox, date_from, date_to,
+                         max_cloud_pct=max_cloud_pct, limit=limit)
+        if not scenes:
+            return json.dumps({
+                "scenes": [],
+                "message": "No Sentinel-2 scenes found for this area and date range.",
+            })
+        return json.dumps({"scenes": [
+            {
+                "date":      s["date"],
+                "name":      s["name"],
+                "cloud_pct": s["cloud_pct"],
+                "source":    s["source"],
+            }
+            for s in scenes
+        ]}, indent=2)
+    except CopernicusSearchError as exc:
+        return json.dumps({"error": str(exc)})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Tool: fetch_sentinel2_pair
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def fetch_sentinel2_pair(
+    min_lon: float,
+    min_lat: float,
+    max_lon: float,
+    max_lat: float,
+    date_from: str,
+    date_mid: str,
+    date_to: str,
+    max_cloud_pct: float = 30.0,
+    bands: str = "B04,B08",
+    out_dir: str = "data",
+) -> str:
+    """
+    Download a before/after Sentinel-2 L2A image pair from the Copernicus
+    Data Space Ecosystem.
+
+    Requires CDSE_USER and CDSE_PASSWORD environment variables (free account
+    at https://dataspace.copernicus.eu/).
+
+    Parameters
+    ----------
+    min_lon, min_lat, max_lon, max_lat : WGS-84 bounding box in decimal degrees.
+    date_from     : Start of the "before" window (YYYY-MM-DD).
+    date_mid      : Boundary between before and after windows (YYYY-MM-DD).
+    date_to       : End of the "after" window (YYYY-MM-DD).
+    max_cloud_pct : Maximum cloud cover accepted (0-100).  Default: 30.
+    bands         : Comma-separated band names to download.
+                    Default "B04,B08" (Red + NIR, 10 m — sufficient for NDVI).
+                    Other options: B02, B03, B05, B06, B07, B8A, B11, B12, SCL.
+    out_dir       : Local directory to save downloaded GeoTIFFs (default: "data").
+
+    Returns
+    -------
+    JSON string with before_path, after_path, scene dates, cloud cover, and source.
+    The output GeoTIFFs have one band per requested band in the order specified.
+    For default B04,B08: band 1 = Red, band 2 = NIR.
+    Use compute_ndvi_diff(before_path, after_path, nir_band=2, red_band=1) for NDVI.
+    """
+    from sentinel2_fetch import (
+        fetch_sentinel2_pair as _fetch,
+        CopernicusAuthError, CopernicusSearchError,
+    )
+
+    bbox       = (min_lon, min_lat, max_lon, max_lat)
+    bands_list = [b.strip() for b in bands.split(",") if b.strip()]
+
+    try:
+        before_path, after_path, before_meta, after_meta = _fetch(
+            bbox, date_from, date_mid, date_to,
+            out_dir=out_dir,
+            max_cloud_pct=max_cloud_pct,
+            bands=bands_list,
+            include_scl=True,   # always download SCL sidecar via MCP for cloud masking
+        )
+        return json.dumps({
+            "before_path":     before_path,
+            "after_path":      after_path,
+            "before_scl_path": before_meta.get("scl_path"),
+            "after_scl_path":  after_meta.get("scl_path"),
+            "before_date":     before_meta["date"],
+            "after_date":      after_meta["date"],
+            "before_cloud":    before_meta.get("cloud_pct"),
+            "after_cloud":     after_meta.get("cloud_pct"),
+            "source":          before_meta["source"],
+            "bands":           bands_list,
+            "cloud_mask_hint": (
+                "SCL sidecars downloaded. Pass before_scl_path/after_scl_path "
+                "to run_change_detection as bbox_scl_before / bbox_scl_after."
+            ),
+            "ndvi_hint":    (
+                "For NDVI, run: compute_ndvi_diff(before_path, after_path, "
+                "nir_band=2, red_band=1)"
+                if bands_list == ["B04", "B08"] else ""
+            ),
+        }, indent=2)
+    except CopernicusAuthError as exc:
+        return json.dumps({"error": f"Authentication failed: {exc}"})
+    except CopernicusSearchError as exc:
+        return json.dumps({"error": f"Catalogue search failed: {exc}"})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Tool: list_catalogue
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def list_catalogue(
+    limit: int = 20,
+    change_type: str = "",
+    min_change_pct: float = 0.0,
+    mode: str = "",
+) -> str:
+    """
+    List past TerraLens change-detection analyses from the local scene catalogue.
+
+    Parameters
+    ----------
+    limit          : Maximum number of records to return (default 20, max 200).
+    change_type    : Optional filter — return only records matching this label
+                     (e.g. "wildfire", "flooding", "deforestation").
+    min_change_pct : Return only records where the scene changed by at least
+                     this percentage (0-100).  Default: 0 (no filter).
+    mode           : Optional filter by acquisition mode: "upload", "nasa",
+                     or "sentinel2".
+
+    Returns
+    -------
+    JSON string with a list of catalogue entries (id, date, before_name,
+    after_name, change_percent, change_type, confidence, narrative excerpt).
+    """
+    from catalogue import list_entries, catalogue_stats
+
+    try:
+        entries = list_entries(
+            limit=min(max(1, limit), 200),
+            change_type=change_type.strip() or None,
+            min_change_pct=min_change_pct if min_change_pct > 0 else None,
+            mode=mode.strip() or None,
+        )
+        stats = catalogue_stats()
+        return json.dumps({
+            "catalogue_stats": stats,
+            "entries": [
+                {
+                    "id":             e["id"],
+                    "analysed_at":    e.get("analysed_at", "")[:10],
+                    "before_name":    e.get("before_name"),
+                    "after_name":     e.get("after_name"),
+                    "mode":           e.get("mode"),
+                    "change_percent": e.get("change_percent"),
+                    "change_type":    e.get("change_type"),
+                    "confidence":     e.get("confidence"),
+                    "date_range":     e.get("date_range"),
+                    "narrative_excerpt": (e.get("narrative") or "")[:200],
+                }
+                for e in entries
+            ],
+        }, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_catalogue_entry
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_catalogue_entry(entry_id: int) -> str:
+    """
+    Retrieve the full details of a single catalogue entry by its numeric ID.
+
+    Parameters
+    ----------
+    entry_id : The integer ID of the catalogue entry to retrieve.
+               Use list_catalogue to find IDs.
+
+    Returns
+    -------
+    JSON string with all stored fields for the entry, including the full
+    narrative text, bbox coordinates, and all change statistics.
+    """
+    from catalogue import get_entry
+
+    try:
+        entry = get_entry(entry_id)
+        if entry is None:
+            return json.dumps({"error": f"No catalogue entry with id={entry_id}."})
+        return json.dumps(entry, indent=2, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+# ---------------------------------------------------------------------------
 # Tool: narrate_change
 # ---------------------------------------------------------------------------
 
@@ -278,8 +529,114 @@ def narrate_change(
     }
 
     try:
-        narrative, source = narrate_with_granite(stats, date_range=date_range)
-        return json.dumps({"narrative": narrative, "source": source}, indent=2)
+        narrative, source, classified = narrate_with_granite(stats, date_range=date_range)
+        return json.dumps({
+            "narrative":   narrative,
+            "source":      source,
+            "change_type": classified.get("change_type"),
+            "confidence":  classified.get("confidence"),
+            "caveat":      classified.get("caveat"),
+        }, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Tool: schedule_aoi
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def schedule_aoi(
+    name: str,
+    min_lon: float,
+    min_lat: float,
+    max_lon: float,
+    max_lat: float,
+    source: str = "modis",
+    max_cloud_pct: float = 30.0,
+    bands: str = "B04,B08",
+    threshold: int = 40,
+    notes: str = "",
+) -> str:
+    """
+    Register a new watched Area of Interest (AOI) with the TerraLens scheduler.
+
+    Once registered, running ``python scheduler.py`` (or the daemon) will
+    automatically check for new satellite acquisitions over this AOI, run
+    change detection + Granite narration, and save results to the catalogue.
+
+    Parameters
+    ----------
+    name          : Human-readable label for the AOI.
+    min_lon, min_lat, max_lon, max_lat : WGS-84 bounding box.
+    source        : Imagery source — "modis" (daily, no auth),
+                    "landsat" (annual, no auth), or "sentinel2" (10 m, requires
+                    CDSE_USER/CDSE_PASSWORD).
+    max_cloud_pct : Sentinel-2 only — reject scenes with cloud cover above this
+                    value (0-100).  Default: 30.
+    bands         : Sentinel-2 only — comma-separated band names to download.
+                    Default "B04,B08" (Red + NIR, sufficient for NDVI + change).
+    threshold     : Pixel-intensity difference threshold for change detection
+                    (0-255).  Lower = more sensitive.  Default: 40.
+    notes         : Optional free-text notes stored with the AOI.
+
+    Returns
+    -------
+    JSON string with the new AOI id and a confirmation message.
+    """
+    from scheduler import add_watched_aoi
+
+    bbox       = (min_lon, min_lat, max_lon, max_lat)
+    bands_list = [b.strip() for b in bands.split(",") if b.strip()]
+
+    try:
+        aoi_id = add_watched_aoi(
+            name=name,
+            bbox=bbox,
+            source=source.lower(),
+            max_cloud_pct=max_cloud_pct,
+            bands=bands_list,
+            threshold=threshold,
+            notes=notes,
+        )
+        return json.dumps({
+            "aoi_id":  aoi_id,
+            "name":    name,
+            "source":  source,
+            "bbox":    list(bbox),
+            "message": (
+                f"AOI '{name}' registered with id={aoi_id}.  "
+                "Run 'python scheduler.py' to trigger the first poll, "
+                "or 'python scheduler.py --daemon' for continuous monitoring."
+            ),
+        }, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Tool: list_watched_aois
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def list_watched_aois(enabled_only: bool = False) -> str:
+    """
+    List all Areas of Interest registered with the TerraLens scheduler.
+
+    Parameters
+    ----------
+    enabled_only : If true, only return AOIs that are currently active (not paused).
+
+    Returns
+    -------
+    JSON string with a list of AOI records, each including id, name, source,
+    bbox, last check time, last scene date, and check count.
+    """
+    from scheduler import list_watched_aois as _list
+
+    try:
+        aois = _list(enabled_only=enabled_only)
+        return json.dumps({"aois": aois, "total": len(aois)}, indent=2, default=str)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
